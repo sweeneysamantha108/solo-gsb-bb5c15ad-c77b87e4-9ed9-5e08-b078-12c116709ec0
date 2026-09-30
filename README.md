@@ -21,6 +21,10 @@
 - 偏移每次变更递增赛事 `offsets_version`；暂定成绩随后立即按**同一批已提交扫描与当前偏移版本**
   重算。偏移变更与扫描提交、撤销、封存共用赛事行锁**串行执行**；封存后拒绝偏移变更，
   已封存成绩快照不受任何后续请求影响。
+- **封存前偏移预览**：工作人员可一次提交一组非空的（点位、有符号整数秒）拟定偏移，
+  服务在**同一个一致状态**（同一批已提交且未撤销扫描 + 当前偏移版本）下分别裁决
+  **现状 / 拟定**两套结果，逐名返回两侧完赛状态、所用扫描原始与校准时间、完赛时间、
+  名次及变化；预览**不写入**任何偏移、版本或封存快照，封存赛事拒绝预览。
 - 封存（seal）前撤销扫描会使**暂定成绩重算**；封存时冻结**一致快照**，此后提交、撤销与偏移变更一律拒绝。
 - `docker compose up --build` 一键启动（应用启动时自动建表并对旧库补齐偏移列，含数据库连接重试）。
 
@@ -83,6 +87,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET` | `/races/{race_id}/points/offsets` | 查询全部点位当前偏移（未设置返回 0） |
 | `GET` | `/races/{race_id}/points/{point}/offset` | 查询单个点位偏移；未知点位 `404` |
 | `PUT` | `/races/{race_id}/points/{point}/offset` | 设置/替换有符号整数秒偏移（首次 `201`/替换 `200`）；封存后 `409` |
+| `POST` | `/races/{race_id}/offsets/preview` | 拟定一组偏移并预览现状/拟定两侧成绩（只读，不落库）；封存后 `409` |
 | `GET` | `/races/{race_id}/results` | 全部选手成绩（封存前实时暂定，封存后取快照） |
 | `GET` | `/races/{race_id}/runners/{runner_id}/result` | 单个选手成绩 |
 | `POST` | `/races/{race_id}/seal` | 封存：冻结一致快照；重复封存幂等 |
@@ -171,7 +176,89 @@ PUT /races/{race_id}/points/C2/offset
 - 偏移变更与扫描提交/批量、撤销、封存通过赛事行 `FOR UPDATE` 锁串行；
   封存后 `PUT` 返回 `409 race_sealed`，封存前的偏移版本随快照冻结。
 
-### 2.4 成绩
+### 2.4 封存前偏移预览（只读）
+
+封存前，工作人员可一次提交一组非空的点位/偏移拟定值，预览它对全体选手成绩的影响。
+**未列出的点位沿用当前有效值（未设置即零）**；预览只是试算，不写偏移、不递增
+`offsets_version`、不写封存快照。
+
+```jsonc
+POST /races/{race_id}/offsets/preview
+{
+  "offsets": [
+    {"point": "C2",  "offset_seconds": 0},
+    {"point": "FIN", "offset_seconds": 0}
+  ]
+}
+```
+
+```jsonc
+{
+  "race_id": "...", "name": "City 10K 2026",
+  "sealed": false, "sealed_at": null,
+  "offsets_version": 2,                       // 当前版本；两侧都基于它试算
+  "current_offsets": [                        // 各点当前有效值（未设置=0）
+    {"point": "C1",  "offset_seconds": 0,   "updated_at": null},
+    {"point": "C2",  "offset_seconds": -60, "updated_at": "..."},
+    {"point": "FIN", "offset_seconds": 120, "updated_at": "..."}
+  ],
+  "proposed_offsets": [                       // 拟定生效后的各点值
+    {"point": "C1",  "offset_seconds": 0,   "updated_at": null},
+    {"point": "C2",  "offset_seconds": 0,   "updated_at": "..."},
+    {"point": "FIN", "offset_seconds": 0,   "updated_at": "..."}
+  ],
+  "results": [
+    {
+      "runner_id": "...", "bib": "A01", "name": "Alice", "chip": "CHIP-A",
+      "current": {                            // 现状侧
+        "status": "finished",
+        "finish_time": "2026-10-01T08:32:00+00:00",
+        "total_seconds": 1920.0, "rank": 2,
+        "used_scans": [ /* 同“2.5 成绩”结构：segment/point/scan_no/
+                          occurred_at 原始 / calibrated_at 校准 /
+                          segment_seconds */ ]
+      },
+      "proposed": {                           // 拟定侧（同一批扫描重算）
+        "status": "finished",
+        "finish_time": "2026-10-01T08:30:00+00:00",
+        "total_seconds": 1800.0, "rank": 1,
+        "used_scans": [ /* 同上 */ ]
+      },
+      "status_changed": false,
+      "rank_change": 1,                       // current.rank - proposed.rank
+                                              //   正数=名次提升；任一未完赛为 null
+      "finish_time_change_seconds": -120.0    // 拟定-现状完赛时间，负=更快；
+                                              //   任一未完赛为 null
+    },
+    {
+      "bib": "C03",
+      "current":  {"status": "finished",  "finish_time": "...", "rank": 1, ...},
+      "proposed": {"status": "did_not_finish", "finish_time": null,
+                   "total_seconds": null, "rank": null, "used_scans": []},
+      "status_changed": true,
+      "rank_change": null,
+      "finish_time_change_seconds": null
+    }
+  ]
+}
+```
+
+- 两侧均包含：完赛状态、所用扫描的**原始 `occurred_at` 与校准 `calibrated_at`**、
+  校准 `finish_time`/`total_seconds`、`rank`；**未完赛者的完赛时间与名次为 `null`**，
+  `used_scans` 为空数组。结果按拟定侧名次（完赛者按校准完赛时间，之后 DNF 按 bib）排列。
+- 变化字段：`status_changed` 标识状态翻转；仅两侧都完赛时给出有符号的
+  `rank_change`（现状名次 − 拟命名次，正数表示名次提升）与
+  `finish_time_change_seconds`（拟定完赛时间 − 现状完赛时间，负数表示更快）；
+  任一侧未完赛时二者为 `null`。
+- 入参沿用设置接口的**严格有符号整数秒**校验：JSON 小数（含 `1.0`）、布尔、字符串
+  一律 `422`；偏移列表必须**非空**（`422`），同一点位**不得重复**
+  （`422 duplicate_point`）；未知赛事 → `404 race_not_found`，未知点位
+  → `404 unknown_point`；赛事已封存 → `409 race_sealed`。
+- **一致性**：预览在单个事务中对赛事行 `SELECT ... FOR UPDATE`，与扫描提交/批量、
+  撤销、偏移修改、封存互斥；同一份已提交且未撤销扫描快照同时供给两次裁决，
+  因此现状侧与拟定侧必然来自同一一致状态。结束时回滚事务并释放行锁，不留任何写入。
+
+### 2.5 成绩
 
 ```jsonc
 GET /races/{race_id}/results
@@ -210,7 +297,7 @@ GET /races/{race_id}/results
   同到达时间取扫描编号序列字典序最小”的前驱路径；最后一层再按
   （校准完赛时间，编号序列）取最优。
 
-### 2.5 撤销与封存
+### 2.6 撤销与封存
 
 - `DELETE /races/{race_id}/scans/{scan_no}`：封存前可用；撤销后 `GET /results`
   立即反映重算的暂定成绩。重复撤销返回 `409`，未知编号返回 `404`。
@@ -220,8 +307,8 @@ GET /races/{race_id}/results
   该操作对赛事行加 `FOR UPDATE` 行锁，与扫描提交/撤销/偏移变更互斥，
   保证快照与已提交数据一致。重复调用幂等并返回同一份快照。
 - 封存后任何 `POST .../scans`、`.../scans/batch`、`DELETE .../scans/...`、
-  `PUT .../points/.../offset` 均返回 `409`；偏移查询仍可读取（冻结值）。
-  封存快照不再随后续任何请求变化。
+  `PUT .../points/.../offset`、`POST .../offsets/preview` 均返回 `409`；
+  偏移查询仍可读取（冻结值）。封存快照不再随后续任何请求变化。
 
 ---
 
@@ -241,9 +328,13 @@ bash examples/curl.sh
 `examples/demo.py` 中内置了字典序决胜场景：选手 Dan 在三个点各有两条
 发生时间相同的扫描，编号路径 `"DA01","DB01","DC01"` 与 `"DA02","DB02","DC02"`
 完赛时间一致，服务选择扫描编号元组字典序更小的 `"DA01","DB01","DC01"`。
-步骤 4b 还演示：偏移查询（未设置即零）、给 C2/FIN 设置 −60 秒后 Carol 由 DNF
+步骤 4b 还演示：偏移查询（未设置即零）、给 C2/FIN 设置偏移后 Carol 由 DNF
 变为完赛（排名随之重算、原始时间保留、校准时间展示）、非整数与未知点位拒绝、
 替换为 `200/replaced=true`、复位后成绩还原，以及封存后偏移变更被拒、快照保持封存前版本。
+步骤 4c 演示**偏移预览**：同一一致状态下逐名对比现状与拟定方案的完赛状态、
+原始/校准所用扫描、完赛时间与名次变化（Carol 完赛→DNF、Alice 名次回升、
+未完赛侧完赛时间/名次为空），空列表/重复点位/未知点位/非整数偏移拒绝，
+且预览不落库；封存后预览同样返回 `409`。
 
 ---
 

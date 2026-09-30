@@ -14,6 +14,7 @@ from .database import SessionLocal, init_db
 from .schemas import (
     ErrorBody,
     OffsetListOut,
+    OffsetPreviewIn,
     OffsetSetIn,
     OffsetSetOut,
     PointOffsetOut,
@@ -43,7 +44,9 @@ app = FastAPI(
         "Race configuration, out-of-order chip scan ingestion with "
         "idempotent replay/conflict detection, per-point signed integer "
         "clock offsets, provisional results recomputed from calibrated "
-        "times, scan revocation and sealing of a frozen result snapshot."
+        "times, a read-only pre-seal preview comparing current vs "
+        "proposed offsets from one consistent state, scan revocation and "
+        "sealing of a frozen result snapshot."
     ),
 )
 
@@ -198,6 +201,27 @@ def set_point_offset(
     )
     response.status_code = 200 if replaced else 201
     return payload_out
+
+
+@app.post(
+    "/races/{race_id}/offsets/preview",
+    tags=["offsets"],
+    responses={
+        404: {"model": ErrorBody},
+        409: {"model": ErrorBody},
+        422: {"model": ErrorBody},
+    },
+)
+def preview_point_offsets(
+    race_id: str,
+    payload: OffsetPreviewIn,
+    db: Session = Depends(get_db),
+) -> dict:
+    return service.preview_offsets(
+        db,
+        race_id,
+        [(item.point, item.offset_seconds) for item in payload.offsets],
+    )
 
 
 # --------------------------------------------------------------------------

@@ -559,6 +559,165 @@ def set_point_offset(
 
 
 # --------------------------------------------------------------------------
+# Pre-seal offset preview (never writes anything)
+# --------------------------------------------------------------------------
+
+
+def _effective_offset_rows(
+    race: Race,
+    overrides: Optional[dict[int, int]] = None,
+) -> list[dict]:
+    """Effective offset of every point; overrides only exist inside a preview.
+
+    Overriding an unset point leaves ``updated_at`` null, mirroring "unset
+    is zero"; overriding a stored point keeps its ``updated_at`` (the
+    proposed value is not persisted).
+    """
+
+    stored = {o.point_id: o for o in race.point_offsets}
+    rows: list[dict] = []
+    for p in sorted(race.points, key=lambda p: p.position):
+        o = stored.get(p.id)
+        if overrides is not None and p.id in overrides:
+            rows.append(
+                {
+                    "point": p.code,
+                    "offset_seconds": overrides[p.id],
+                    "updated_at": o.updated_at if o is not None else None,
+                }
+            )
+        else:
+            rows.append(_serialize_offset(p, o))
+    return rows
+
+
+def preview_offsets(
+    db: Session,
+    race_id: str,
+    items: Iterable[tuple[str, int]],
+) -> dict:
+    """Adjudicate current vs proposed offsets against one consistent state.
+
+    The race row is taken ``FOR UPDATE`` for the whole preview, so the two
+    sides are computed from exactly the same set of committed, non-revoked
+    scans and the current offset version; a concurrent scan submit/revoke,
+    offset change or seal must wait (or, having sealed the race, reject).
+    Nothing is written: no offsets, no offsets_version bump, no snapshot,
+    and the transaction is rolled back on exit.
+    """
+
+    overrides: dict[int, int] = {}
+    race: Optional[Race] = None
+    payload: Optional[dict] = None
+    try:
+        race = get_race_locked(db, race_id)
+        if race.sealed:
+            raise ApiError(409, "race_sealed",
+                           "race is sealed; offset preview is rejected")
+
+        seen: set[str] = set()
+        for code, value in items:
+            if code in seen:
+                raise ApiError(
+                    422, "duplicate_point",
+                    f"point {code!r} appears more than once in the preview",
+                )
+            seen.add(code)
+            point = next((p for p in race.points if p.code == code), None)
+            if point is None:
+                raise ApiError(
+                    404, "unknown_point",
+                    f"point {code!r} does not exist in this race",
+                )
+            overrides[point.id] = value
+
+        # One consistent snapshot of active scans feeds both adjudications.
+        active_scans = db.scalars(
+            select(Scan)
+            .where(Scan.race_id == race.id, Scan.revoked.is_(False))
+            .order_by(Scan.occurred_at, Scan.scan_no)
+        ).all()
+
+        current_offsets = {o.point_id: o.offset_seconds for o in race.point_offsets}
+        proposed_offsets = dict(current_offsets)
+        proposed_offsets.update(overrides)
+
+        current_results = _runner_results(
+            db,
+            race,
+            active_scans=active_scans,
+            offset_by_point_id=current_offsets,
+        )
+        proposed_results = _runner_results(
+            db,
+            race,
+            active_scans=active_scans,
+            offset_by_point_id=proposed_offsets,
+        )
+        current_by_id = {r["runner_id"]: r for r in current_results}
+
+        results: list[dict] = []
+        for proposed in proposed_results:
+            current = current_by_id[proposed["runner_id"]]
+            cur_finished = current["status"] == "finished"
+            new_finished = proposed["status"] == "finished"
+            results.append(
+                {
+                    "runner_id": proposed["runner_id"],
+                    "bib": proposed["bib"],
+                    "name": proposed["name"],
+                    "chip": proposed["chip"],
+                    "current": {
+                        "status": current["status"],
+                        "finish_time": current["finish_time"],
+                        "total_seconds": current["total_seconds"],
+                        "rank": current["rank"],
+                        "used_scans": current["used_scans"],
+                    },
+                    "proposed": {
+                        "status": proposed["status"],
+                        "finish_time": proposed["finish_time"],
+                        "total_seconds": proposed["total_seconds"],
+                        "rank": proposed["rank"],
+                        "used_scans": proposed["used_scans"],
+                    },
+                    "status_changed": current["status"] != proposed["status"],
+                    # Signed change of place: positive = better (e.g. 3 -> 1).
+                    # Null whenever either side is DNF.
+                    "rank_change": (
+                        current["rank"] - proposed["rank"]
+                        if cur_finished and new_finished
+                        else None
+                    ),
+                    # Proposed minus current finish epoch; negative = faster.
+                    # Null whenever either side is DNF.
+                    "finish_time_change_seconds": (
+                        proposed["finish_time"] - current["finish_time"]
+                    ).total_seconds()
+                    if cur_finished and new_finished
+                    else None,
+                }
+            )
+
+        payload = {
+            "race_id": str(race.id),
+            "name": race.name,
+            "sealed": False,
+            "sealed_at": None,
+            "offsets_version": race.offsets_version,
+            "current_offsets": _effective_offset_rows(race),
+            "proposed_offsets": _effective_offset_rows(race, overrides),
+            "results": results,
+        }
+    finally:
+        # Preview is read-only: discard any transaction state and release
+        # the FOR UPDATE row lock promptly.
+        db.rollback()
+
+    return payload
+
+
+# --------------------------------------------------------------------------
 # Adjudication
 # --------------------------------------------------------------------------
 
@@ -566,6 +725,9 @@ def set_point_offset(
 def _runner_results(
     db: Session,
     race: Race,
+    *,
+    active_scans: Optional[list[Scan]] = None,
+    offset_by_point_id: Optional[dict[int, int]] = None,
 ) -> list[dict]:
     points = sorted(race.points, key=lambda p: p.position)
     point_by_id = {p.id: p for p in points}
@@ -579,15 +741,20 @@ def _runner_results(
         for s in sorted(race.segments, key=lambda s: s.position)
     ]
 
-    active_scans = db.scalars(
-        select(Scan)
-        .where(Scan.race_id == race.id, Scan.revoked.is_(False))
-        .order_by(Scan.occurred_at, Scan.scan_no)
-    ).all()
+    if active_scans is None:
+        active_scans = db.scalars(
+            select(Scan)
+            .where(Scan.race_id == race.id, Scan.revoked.is_(False))
+            .order_by(Scan.occurred_at, Scan.scan_no)
+        ).all()
 
     # Per-point signed integer-second clock offsets; an unset point (no row)
-    # is treated as zero. Timing rules run on calibrated timestamps.
-    offset_by_point_id = {o.point_id: o.offset_seconds for o in race.point_offsets}
+    # is treated as zero. Timing rules run on calibrated timestamps. A
+    # preview call may pass a copy with proposed values layered on top.
+    if offset_by_point_id is None:
+        offset_by_point_id = {
+            o.point_id: o.offset_seconds for o in race.point_offsets
+        }
 
     def _calibrated(scan: Scan) -> datetime:
         seconds = offset_by_point_id.get(scan.point_id, 0)

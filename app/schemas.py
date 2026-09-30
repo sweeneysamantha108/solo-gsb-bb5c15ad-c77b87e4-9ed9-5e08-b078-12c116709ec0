@@ -125,6 +125,22 @@ class OffsetSetIn(BaseModel):
     )
 
 
+class OffsetPreviewItemIn(BaseModel):
+    # One proposed (point, signed integer-second offset) pair. Same strict
+    # integer validation as OffsetSetIn; point existence/duplication is
+    # checked in the service layer.
+    point: str = Field(..., min_length=1, max_length=64)
+    offset_seconds: int = Field(
+        ..., strict=True, ge=-2_147_483_648, le=2_147_483_647
+    )
+
+
+class OffsetPreviewIn(BaseModel):
+    # A non-empty set of proposed offsets; points not listed keep their
+    # current effective value. Duplicate points are rejected (422).
+    offsets: list[OffsetPreviewItemIn] = Field(..., min_length=1)
+
+
 # --------------------------------------------------------------------------
 # Outputs
 # --------------------------------------------------------------------------

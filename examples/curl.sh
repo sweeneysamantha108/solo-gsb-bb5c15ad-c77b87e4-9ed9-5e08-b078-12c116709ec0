@@ -73,6 +73,18 @@ curl -sS -o /dev/null -w '%{http_code}\n' -X PUT "$BASE_URL/races/$RACE_ID/point
 echo "## results now show calibrated_at alongside raw occurred_at"
 curl -fsS "$BASE_URL/races/$RACE_ID/results"; echo
 
+echo "## preview other proposed offsets (nothing is written)"
+curl -fsS -X POST "$BASE_URL/races/$RACE_ID/offsets/preview" \
+  -H 'Content-Type: application/json' \
+  -d '{"offsets":[{"point":"C1","offset_seconds":0},{"point":"FIN","offset_seconds":-15}]}'; echo
+
+echo "## preview rejects an empty list / a duplicate point (422)"
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST "$BASE_URL/races/$RACE_ID/offsets/preview" \
+  -H 'Content-Type: application/json' -d '{"offsets":[]}'
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST "$BASE_URL/races/$RACE_ID/offsets/preview" \
+  -H 'Content-Type: application/json' \
+  -d '{"offsets":[{"point":"C1","offset_seconds":1},{"point":"C1","offset_seconds":2}]}'
+
 echo "## reset the offset to zero, then revoke a scan"
 curl -sS -o /dev/null -w '%{http_code}\n' -X PUT "$BASE_URL/races/$RACE_ID/points/C1/offset" \
   -H 'Content-Type: application/json' -d '{"offset_seconds": 0}'

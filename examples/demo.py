@@ -18,15 +18,21 @@ The script walks through every requirement:
   4b. per-point signed integer-second clock offsets: query (unset == zero),
       set/replace, non-integer and unknown-point rejection, provisional
       results recomputed from calibrated times while raw times are kept
+  4c. pre-seal offset preview: current vs proposed adjudication per runner
+      (status, raw/calibrated used scans, finish, rank and deltas) from one
+      consistent state; empty/duplicate/unknown/non-integer rejected; the
+      preview stores nothing
   5. revoke a scan before sealing -> provisional result recomputed
-  6. seal the race -> frozen snapshot; afterwards submit/revoke and offset
-     changes are rejected, but the snapshot keeps the pre-seal version
+  6. seal the race -> frozen snapshot; afterwards submit/revoke, offset
+     changes and previews are rejected, but the snapshot keeps the
+     pre-seal version
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -37,6 +43,20 @@ BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:8000").rstrip("/")
 # Fixed UTC instant so the demo is reproducible.
 T0 = datetime(2026, 10, 1, 8, 0, 0, tzinfo=timezone.utc)
 CUTOFF = T0 + timedelta(hours=1)
+
+# Matches an ISO-8601 instant ending in "Z" so response timestamps compare
+# cleanly against the "+00:00" strings produced by at() for request bodies.
+_ISO_Z = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
+
+
+def _normalize(value):
+    if isinstance(value, str) and _ISO_Z.match(value):
+        return value[:-1] + "+00:00"
+    if isinstance(value, dict):
+        return {k: _normalize(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_normalize(v) for v in value]
+    return value
 
 
 def at(minute: int, second: int = 0) -> str:
@@ -54,10 +74,12 @@ def request(method: str, path: str, body=None):
     try:
         with urllib.request.urlopen(req) as resp:
             payload = resp.read()
-            return resp.status, json.loads(payload) if payload else None
+            parsed = json.loads(payload) if payload else None
+            return resp.status, _normalize(parsed)
     except urllib.error.HTTPError as exc:
         payload = exc.read()
-        return exc.code, json.loads(payload) if payload else None
+        parsed = json.loads(payload) if payload else None
+        return exc.code, _normalize(parsed)
 
 
 def step(title: str) -> None:
@@ -299,17 +321,17 @@ def main() -> None:
     assert by_bib["C03"]["status"] == "did_not_finish"
     print("ok C2 offset -60 alone does not make Carol's path valid")
 
-    # FIN clock also 60 s slow: C2(19) -> FIN(21) calibrated, gap exactly
-    # 300 s -> valid closed-interval boundary; finish calibrates to 21:00,
-    # still inside the 60-minute cutoff.
+    # FIN clock 120 s fast: raw 22:00 calibrates to 24:00, so C2(19) ->
+    # FIN(24) is exactly 300 s -> the closed-interval lower boundary; the
+    # finish calibrates to 24:00, still inside the 60-minute cutoff.
     status, body = request(
-        "PUT", f"{rp}/points/FIN/offset", {"offset_seconds": -60}
+        "PUT", f"{rp}/points/FIN/offset", {"offset_seconds": 120}
     )
     expect(201, status, "first set of FIN offset")
 
     status, body = request("GET", f"{rp}/points/FIN/offset")
     expect(200, status, "get one point offset (set value)")
-    assert body["offset_seconds"] == -60 and body["updated_at"] is not None
+    assert body["offset_seconds"] == 120 and body["updated_at"] is not None
 
     status, results = request("GET", f"{rp}/results")
     show(status, results)
@@ -317,23 +339,24 @@ def main() -> None:
     by_bib = {r["bib"]: r for r in results["results"]}
     carol = by_bib["C03"]
     assert carol["status"] == "finished"
-    assert carol["finish_time"] == at(21), carol["finish_time"]
-    assert carol["total_seconds"] == 21 * 60
+    assert carol["finish_time"] == at(24), carol["finish_time"]
+    assert carol["total_seconds"] == 24 * 60
     used = {u["point"]: u for u in carol["used_scans"]}
     # Raw scan timestamps are kept; calibrated timestamps are shown too.
     assert used["C2"]["occurred_at"] == at(20)
     assert used["C2"]["calibrated_at"] == at(19)
     assert used["FIN"]["occurred_at"] == at(22)
-    assert used["FIN"]["calibrated_at"] == at(21)
+    assert used["FIN"]["calibrated_at"] == at(24)
     assert used["C2"]["segment_seconds"] == 9 * 60
-    assert used["FIN"]["segment_seconds"] == 3 * 60
+    assert used["FIN"]["segment_seconds"] == 5 * 60
     print("ok Carol finishes after C2/FIN calibration (raw kept, calibrated shown)")
 
-    # C2/FIN offsets shift Alice's and Dan's calibrated finishes to 29:00,
-    # while Carol calibrates to 21:00: the ranking is Carol, then Alice,
-    # then Dan (Alice vs Dan tie at 29:00 breaks on scan-no sequence).
-    assert by_bib["A01"]["finish_time"] == at(29)
-    assert by_bib["D04"]["finish_time"] == at(29)
+    # C2 offset shifts Alice's and Dan's C2 scans to 19:00 while their FIN
+    # scans (FIN clock 120 s fast) calibrate to 32:00; Carol calibrates to
+    # 24:00: the ranking is Carol, then Alice, then Dan (Alice vs Dan tie at
+    # 32:00 breaks on scan-no sequence).
+    assert by_bib["A01"]["finish_time"] == at(32)
+    assert by_bib["D04"]["finish_time"] == at(32)
     assert carol["rank"] == 1
     assert by_bib["A01"]["rank"] == 2
     assert by_bib["D04"]["rank"] == 3
@@ -357,6 +380,81 @@ def main() -> None:
 
     # Replacing C2's offset is HTTP 200 with replaced=true. Reset C2/FIN to
     # zero so the remainder of the demo sees the original adjudication.
+    # ------------------------------------------------------------------ #
+    step("4c. Offset preview: current vs proposed, computed but not stored")
+    # ------------------------------------------------------------------ #
+    # Before resetting anything for real, staff preview the effect of
+    # resetting C2/FIN to zero: the "current" side is adjudicated with the
+    # stored offsets (C2=-60, FIN=120), the "proposed" side with the request
+    # values layered on top; points not listed keep their current value.
+    status, preview = request("POST", f"{rp}/offsets/preview", {"offsets": [
+        {"point": "C2", "offset_seconds": 0},
+        {"point": "FIN", "offset_seconds": 0},
+    ]})
+    show(status, preview)
+    expect(200, status, "offset preview")
+    assert preview["offsets_version"] == v0 + 2
+    assert [(o["point"], o["offset_seconds"])
+            for o in preview["current_offsets"]] == [
+        ("C1", 0), ("C2", -60), ("FIN", 120),
+    ]
+    assert [(o["point"], o["offset_seconds"])
+            for o in preview["proposed_offsets"]] == [
+        ("C1", 0), ("C2", 0), ("FIN", 0),
+    ]
+    pv = {r["bib"]: r for r in preview["results"]}
+
+    # Carol drops back to DNF under the proposal; finish/rank are null.
+    carol_pv = pv["C03"]
+    assert carol_pv["current"]["status"] == "finished"
+    assert carol_pv["current"]["rank"] == 1
+    assert carol_pv["proposed"]["status"] == "did_not_finish"
+    assert carol_pv["proposed"]["finish_time"] is None
+    assert carol_pv["proposed"]["rank"] is None
+    assert carol_pv["proposed"]["used_scans"] == []
+    assert carol_pv["status_changed"] is True
+    assert carol_pv["rank_change"] is None
+    print("ok preview: Carol finished@1 -> DNF (empty finish time and rank)")
+
+    # Alice moves back to rank 1 (rank_change +1, finish 120 s earlier).
+    alice_pv = pv["A01"]
+    assert alice_pv["current"]["rank"] == 2
+    assert alice_pv["proposed"]["rank"] == 1
+    assert alice_pv["status_changed"] is False
+    assert alice_pv["rank_change"] == 1
+    assert alice_pv["finish_time_change_seconds"] == -120.0
+    # Both sides carry the raw and calibrated times of the used scans.
+    assert alice_pv["current"]["used_scans"][-1]["calibrated_at"] == at(32)
+    assert alice_pv["proposed"]["used_scans"][-1]["calibrated_at"] == at(30)
+    assert alice_pv["proposed"]["used_scans"][-1]["occurred_at"] == at(30)
+    print("ok preview: Alice rank 2->1, finish_time_change -120 s, raw kept")
+
+    # The preview must not persist anything: offsets and version unchanged.
+    status, body = request("GET", f"{rp}/points/offsets")
+    assert body["offsets_version"] == v0 + 2
+    assert [(o["point"], o["offset_seconds"]) for o in body["offsets"]] == [
+        ("C1", 0), ("C2", -60), ("FIN", 120),
+    ]
+    print("ok preview wrote no offsets and did not bump offsets_version")
+
+    # Preview-specific rejections: empty list, duplicate point, unknown
+    # point, and non-integer offsets reuse the same strict validation.
+    status, body = request("POST", f"{rp}/offsets/preview", {"offsets": []})
+    expect(422, status, "empty preview list rejected")
+    status, body = request("POST", f"{rp}/offsets/preview", {"offsets": [
+        {"point": "C2", "offset_seconds": -60},
+        {"point": "C2", "offset_seconds": 30},
+    ]})
+    expect(422, status, "duplicate preview point rejected")
+    status, body = request("POST", f"{rp}/offsets/preview", {"offsets": [
+        {"point": "NOPE", "offset_seconds": 5},
+    ]})
+    expect(404, status, "unknown preview point rejected")
+    status, body = request("POST", f"{rp}/offsets/preview", {"offsets": [
+        {"point": "C2", "offset_seconds": 5.0},
+    ]})
+    expect(422, status, "non-integer preview offset rejected")
+
     status, body = request(
         "PUT", f"{rp}/points/C2/offset", {"offset_seconds": 0}
     )
@@ -443,6 +541,14 @@ def main() -> None:
     )
     show(status, body)
     expect(409, status, "offset change after sealing rejected")
+
+    # Previews are likewise rejected for a sealed race.
+    status, body = request(
+        "POST", f"{rp}/offsets/preview",
+        {"offsets": [{"point": "C1", "offset_seconds": 30}]},
+    )
+    show(status, body)
+    expect(409, status, "offset preview after sealing rejected")
 
     # Offset queries still work and keep reporting the frozen version.
     status, body = request("GET", f"{rp}/points/offsets")
