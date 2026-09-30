@@ -25,7 +25,7 @@ from .database import (
     SegmentRow,
     utcnow,
 )
-from .schemas import RaceCreate, ScanCreate
+from .schemas import OffsetPreviewIn, RaceCreate, ScanCreate
 
 
 class ApiError(Exception):
@@ -559,6 +559,148 @@ def set_point_offset(
 
 
 # --------------------------------------------------------------------------
+# Pre-seal "what-if" offset preview (read-only: nothing is persisted)
+# --------------------------------------------------------------------------
+
+
+def _side_view(result: dict) -> dict:
+    """Reduce a ranked runner result to one side of a preview comparison."""
+
+    return {
+        "status": result["status"],
+        "finish_time": result["finish_time"],
+        "total_seconds": result["total_seconds"],
+        "rank": result["rank"],
+        "used_scans": result["used_scans"],
+    }
+
+
+def _preview_change(current: dict, proposed: dict) -> dict:
+    transition = f"{current['status']}_to_{proposed['status']}"
+
+    rank_before = current["rank"]
+    rank_after = proposed["rank"]
+    if rank_before is not None and rank_after is not None:
+        rank_delta = rank_after - rank_before
+    else:
+        rank_delta = None
+
+    finish_before = current["finish_time"]
+    finish_after = proposed["finish_time"]
+    if finish_before is not None and finish_after is not None:
+        finish_delta = (finish_after - finish_before).total_seconds()
+    else:
+        finish_delta = None
+
+    return {
+        "transition": transition,
+        "rank_before": rank_before,
+        "rank_after": rank_after,
+        "rank_delta": rank_delta,
+        "finish_time_delta_seconds": finish_delta,
+    }
+
+
+def preview_offsets(
+    db: Session, race_id: str, payload: OffsetPreviewIn
+) -> dict:
+    """Adjudicate the current offsets and a proposed set against one
+    consistent state, without persisting anything.
+
+    The race row is taken ``FOR UPDATE`` for the whole computation, exactly
+    like scan submit/revoke, offset writes and sealing: those writers cannot
+    commit while this preview runs, so both sides are guaranteed to derive
+    from the same committed (non-revoked) scans and the same offset version.
+    The transaction is rolled back in every path -- no offset row, no
+    ``offsets_version`` bump and no seal snapshot is written -- and the row
+    lock is released.
+    """
+
+    race = get_race_locked(db, race_id)
+    try:
+        if race.sealed:
+            raise ApiError(409, "race_sealed",
+                           "race is sealed; offset previews are not available")
+
+        items = payload.offsets
+
+        codes = [item.point for item in items]
+        if len(codes) != len(set(codes)):
+            dupes = sorted({c for c in codes if codes.count(c) > 1})
+            raise ApiError(
+                422, "duplicate_point",
+                f"point listed more than once in the preview: {dupes}",
+            )
+
+        point_by_code = {p.code: p for p in race.points}
+        for code in codes:
+            if code not in point_by_code:
+                raise ApiError(
+                    404, "unknown_point",
+                    f"point {code!r} does not exist in this race",
+                )
+
+        # Unlisted points keep their current value (unset == zero).
+        overrides = {
+            point_by_code[item.point].id: item.offset_seconds for item in items
+        }
+
+        # Both adjudications read the same committed scans inside this one
+        # locked transaction.
+        current_results = _runner_results(db, race)
+        proposed_results = _runner_results(
+            db, race, offset_overrides=overrides
+        )
+
+        current_by_runner = {r["runner_id"]: r for r in current_results}
+        proposed_by_runner = {r["runner_id"]: r for r in proposed_results}
+
+        comparisons: list[dict] = []
+        for current in current_results:
+            runner_id = current["runner_id"]
+            proposed = proposed_by_runner[runner_id]
+            comparisons.append(
+                {
+                    "runner_id": runner_id,
+                    "bib": current["bib"],
+                    "name": current["name"],
+                    "chip": current["chip"],
+                    "current": _side_view(current),
+                    "proposed": _side_view(proposed),
+                    "change": _preview_change(current, proposed),
+                }
+            )
+
+        current_offset_by_point_id = {
+            o.point_id: o.offset_seconds for o in race.point_offsets
+        }
+        proposed_offsets = [
+            {
+                "point": p.code,
+                "offset_seconds": (
+                    overrides[p.id]
+                    if p.id in overrides
+                    else current_offset_by_point_id.get(p.id, 0)
+                ),
+            }
+            for p in sorted(race.points, key=lambda p: p.position)
+        ]
+
+        return {
+            "race_id": str(race.id),
+            "name": race.name,
+            "sealed": False,
+            "offsets_version": race.offsets_version,
+            "proposed_offsets": proposed_offsets,
+            "results": comparisons,
+        }
+    finally:
+        # Read-only request: never create offsets, bump the version or write
+        # a snapshot. The rollback also releases the race row lock promptly.
+        db.rollback()
+
+
+# --------------------------------------------------------------------------
 # Adjudication
 # --------------------------------------------------------------------------
 
@@ -566,6 +708,8 @@ def set_point_offset(
 def _runner_results(
     db: Session,
     race: Race,
+    *,
+    offset_overrides: Optional[dict[int, int]] = None,
 ) -> list[dict]:
     points = sorted(race.points, key=lambda p: p.position)
     point_by_id = {p.id: p for p in points}
@@ -587,10 +731,20 @@ def _runner_results(
 
     # Per-point signed integer-second clock offsets; an unset point (no row)
     # is treated as zero. Timing rules run on calibrated timestamps.
-    offset_by_point_id = {o.point_id: o.offset_seconds for o in race.point_offsets}
+    # ``offset_overrides`` (point_id -> seconds) is used by the pre-seal
+    # preview only: listed points adjudicate at the proposed value while
+    # unlisted points keep their current setting (still zero when unset).
+    current_offset_by_point_id = {
+        o.point_id: o.offset_seconds for o in race.point_offsets
+    }
+
+    def _offset_seconds(point_id: int) -> int:
+        if offset_overrides is not None and point_id in offset_overrides:
+            return offset_overrides[point_id]
+        return current_offset_by_point_id.get(point_id, 0)
 
     def _calibrated(scan: Scan) -> datetime:
-        seconds = offset_by_point_id.get(scan.point_id, 0)
+        seconds = _offset_seconds(scan.point_id)
         if seconds:
             return scan.occurred_at + timedelta(seconds=seconds)
         return scan.occurred_at

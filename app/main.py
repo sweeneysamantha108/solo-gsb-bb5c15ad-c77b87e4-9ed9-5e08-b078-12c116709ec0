@@ -14,6 +14,8 @@ from .database import SessionLocal, init_db
 from .schemas import (
     ErrorBody,
     OffsetListOut,
+    OffsetPreviewIn,
+    OffsetPreviewOut,
     OffsetSetIn,
     OffsetSetOut,
     PointOffsetOut,
@@ -198,6 +200,26 @@ def set_point_offset(
     )
     response.status_code = 200 if replaced else 201
     return payload_out
+
+
+@app.post(
+    "/races/{race_id}/offsets/preview",
+    response_model=OffsetPreviewOut,
+    tags=["offsets"],
+    responses={
+        404: {"model": ErrorBody},
+        409: {"model": ErrorBody},
+        422: {"model": ErrorBody},
+    },
+)
+def preview_point_offsets(
+    race_id: str,
+    payload: OffsetPreviewIn,
+    db: Session = Depends(get_db),
+) -> dict:
+    # Read-only what-if comparison: adjudicates the current and the proposed
+    # offsets against one locked, consistent state, persisting nothing.
+    return service.preview_offsets(db, race_id, payload)
 
 
 # --------------------------------------------------------------------------

@@ -115,14 +115,32 @@ class ScanBatchCreate(BaseModel):
     scans: list[ScanCreate] = Field(..., min_length=1)
 
 
+# Same strict bounds reused by every endpoint that accepts an offset value
+# (single-point PUT and the pre-seal preview): JSON floats (including
+# whole-valued 5.0), booleans and numeric strings are rejected (HTTP 422)
+# rather than coerced. Bounds match the Postgres INTEGER column (~68 years is
+# plenty for a clock offset) so out-of-range values also 422.
+_OFFSET_SECONDS = Field(
+    ..., strict=True, ge=-2_147_483_648, le=2_147_483_647
+)
+
+
 class OffsetSetIn(BaseModel):
-    # Strict ints only: JSON floats (including whole-valued 5.0), booleans
-    # and numeric strings are rejected (HTTP 422) rather than coerced.
-    # Bounds match the Postgres INTEGER column (~68 years is plenty for a
-    # clock offset) so out-of-range values also 422 instead of overflowing.
-    offset_seconds: int = Field(
-        ..., strict=True, ge=-2_147_483_648, le=2_147_483_647
-    )
+    offset_seconds: int = _OFFSET_SECONDS
+
+
+class OffsetPreviewItemIn(BaseModel):
+    # One proposed point/offset pair. Validation mirrors the PUT endpoint;
+    # the non-empty list and no-duplicate-point rules live on OffsetPreviewIn
+    # / the service layer.
+    point: str = Field(..., min_length=1, max_length=64)
+    offset_seconds: int = _OFFSET_SECONDS
+
+
+class OffsetPreviewIn(BaseModel):
+    # A non-empty list of proposed offsets; points not listed keep their
+    # current value (unset == zero).
+    offsets: list[OffsetPreviewItemIn] = Field(..., min_length=1)
 
 
 # --------------------------------------------------------------------------
@@ -219,6 +237,62 @@ class OffsetListOut(BaseModel):
     sealed: bool
     offsets_version: int
     offsets: list[PointOffsetOut]
+
+
+# --------------------------------------------------------------------------
+# Pre-seal "what-if" offset preview
+# --------------------------------------------------------------------------
+
+
+class PreviewSideOut(BaseModel):
+    # One side of the comparison, adjudicated against the same committed
+    # scans: "current" with live offsets, "proposed" with the request
+    # overrides applied (unlisted points keep their current value).
+    status: Literal["finished", "did_not_finish"]
+    finish_time: Optional[datetime] = None
+    total_seconds: Optional[float] = None
+    rank: Optional[int] = None
+    used_scans: list[UsedScanOut]
+
+
+class PreviewChangeOut(BaseModel):
+    # finished -> finished | finished -> did_not_finish
+    # did_not_finish -> finished | did_not_finish -> did_not_finish
+    transition: Literal[
+        "finished_to_finished",
+        "finished_to_did_not_finish",
+        "did_not_finish_to_finished",
+        "did_not_finish_to_did_not_finish",
+    ]
+    rank_before: Optional[int]
+    rank_after: Optional[int]
+    rank_delta: Optional[int]
+    finish_time_delta_seconds: Optional[float]
+
+
+class PreviewRunnerOut(BaseModel):
+    runner_id: str
+    bib: str
+    name: str
+    chip: str
+    current: PreviewSideOut
+    proposed: PreviewSideOut
+    change: PreviewChangeOut
+
+
+class EffectiveOffsetOut(BaseModel):
+    # The proposed side's effective offsets after every point (in order).
+    point: str
+    offset_seconds: int
+
+
+class OffsetPreviewOut(BaseModel):
+    race_id: str
+    name: str
+    sealed: bool
+    offsets_version: int
+    proposed_offsets: list[EffectiveOffsetOut]
+    results: list[PreviewRunnerOut]
 
 
 class ErrorBody(BaseModel):
